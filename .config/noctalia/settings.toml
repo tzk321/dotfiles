@@ -1,0 +1,6 @@
+[hooks]
+wallpaper_changed = [ "bash /home/sbtzk/.config/noctalia/apply-morandi.sh" ]
+
+# 2026-11-01: 输出改成整数 scale 1 后，noctalia 自己负责界面放大（25% 补偿）
+[accessibility]
+ui_scale = 1.875

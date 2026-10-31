@@ -1,0 +1,4 @@
+# 第三方/缓存，不入库
+.config/noctalia/plugins/
+*.bak-*
+*.log

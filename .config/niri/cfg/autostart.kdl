@@ -1,0 +1,7 @@
+// ────────────── Startup Applications ──────────────
+
+    spawn-sh-at-startup "/usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1 &" // Polkit
+    spawn-sh-at-startup "noctalia"
+    spawn-sh-at-startup "fcitx5 -d --replace"
+    spawn-sh-at-startup "wl-paste --watch cliphist store"
+    spawn-at-startup "babry" "--daemon" // Babry 截图后台常驻，加快快捷键唤起
