@@ -126,3 +126,5 @@ cursor {
     xcursor-size 16
 }
 
+
+include "noctalia.kdl"

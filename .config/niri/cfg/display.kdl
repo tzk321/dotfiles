@@ -10,10 +10,10 @@
 
 output "eDP-1" {
     mode "2560x1440@165.003" // 实际面板最高 165Hz
-    // 1.5 = 1706x960 逻辑, 笔记本 17.3" 上界面大小合适
-    // 支持 fractional-scale 的程序(Qt6/GTK4/Chromium)按 1.5 原生渲染, 是清晰的
-    // 不支持的程序(GTK3/XWayland)会被 niri 重采样一次, 略软但不会变锯齿
-    scale 1.5
+    // 1.25 = 2048x1152 逻辑（1.5 是 1706x960）
+    // 分数缩放对非 fractional-scale 程序(niri 报 scale=2)会做一次重采样,
+    // 想要零重采样只有整数 scale 1 / 2（见 README）
+    scale 1.25
     // 面板支持 165Hz VRR, 与 config.kdl 里游戏窗口规则的 variable-refresh-rate 标记配合
     // 游戏帧率抖动时用 VRR 吃掉抖动, 比固定刷新率硬等垂直同步顺得多
     variable-refresh-rate
