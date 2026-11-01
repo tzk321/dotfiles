@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch the wallpaper directory for new videos (generate poster tiles)
+
+[Path]
+PathModified=%h/Pictures/WallPapers
+Unit=video-wallpaper-posters.service
+
+[Install]
+WantedBy=default.target

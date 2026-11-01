@@ -1,0 +1,6 @@
+[Unit]
+Description=Generate poster tiles for videos so the noctalia wallpaper panel can list them
+
+[Service]
+Type=oneshot
+ExecStart=/home/sbtzk/.local/bin/video-wallpaper posters

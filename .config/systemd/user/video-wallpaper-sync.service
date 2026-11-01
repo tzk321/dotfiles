@@ -1,0 +1,6 @@
+[Unit]
+Description=Sync app color palette with noctalia mpvpaper video wallpaper
+
+[Service]
+Type=oneshot
+ExecStart=/home/sbtzk/.local/bin/video-wallpaper sync

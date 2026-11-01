@@ -1,0 +1,434 @@
+#!/bin/bash
+# video-wallpaper — 视频壁纸的配色联动
+#
+# 播放/切换由 noctalia 官方插件 noctalia/mpvpaper 负责（picker 面板里点缩略图即可），
+# 本脚本只负责：抽静态帧 -> 生成调色板 -> 分发到各应用。
+#
+#   video-wallpaper posters [目录]      给目录里的视频抽帧生成海报 <视频>.jpg（面板里当缩略图用）
+#   video-wallpaper colors [视频] [秒]   手动指定视频取色（默认取视频中点）
+#   video-wallpaper sync                按插件当前分配自动取色/恢复静态配色（systemd path 单元调用）
+#   video-wallpaper on-static-wallpaper  壁纸变化 hook：点海报→起视频；点静态图→停视频
+#   video-wallpaper status              查看状态
+#
+# 依赖：ffmpeg、imagemagick、noctalia（配色生成）、~/.config/noctalia/morandi-gen.py
+#
+# 海报代理：noctalia 自带的壁纸面板只扫图片扩展名（kImageExtensions，无视频），
+# 所以给每个视频在旁边放一张同名海报 <视频>.jpg，面板里点它由本脚本换成视频播放。
+
+set -uo pipefail
+
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/video-wallpaper"
+LAST_FILE="$CACHE_DIR/last-video"
+FRAME_FILE="$CACHE_DIR/frame.jpg"
+OVERVIEW_FILE="$CACHE_DIR/overview.jpg"
+CACHE_ROOT="$CACHE_DIR/palette-cache"
+FRAME_MAX=1600     # 抽帧/取色用的长边（原视频 4K，不需要全图）
+OVERVIEW_MAX=1280  # 喂给壁纸层（overview）的长边
+OVERVIEW_BLUR=6    # 模糊半径
+NOCTALIA_DIR="${NOCTALIA_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/noctalia}"
+NOCTALIA_STATE="${XDG_STATE_HOME:-$HOME/.local/state}/noctalia"
+ASSIGNMENTS="$NOCTALIA_STATE/mpvpaper/assignments.json"
+PALETTE_NAME="video-wallpaper"
+PALETTE_SCHEME="${VIDEO_WALLPAPER_SCHEME:-}"
+VIDEO_EXTENSIONS=(mp4 webm mkv mov)
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+# mpvpaper 进程（过滤掉没人回收的 zombie，否则 clear 后仍会被当成在播放）
+mpvpaper_pids() {
+    ps -eo pid=,stat=,comm= | awk '$3 == "mpvpaper" && $2 !~ /^Z/ { print $1 }'
+}
+
+# systemd 用户管理器的 WAYLAND_DISPLAY 可能是旧会话残留（本机就遇到过 wayland-2 vs wayland-1），
+# 那样 noctalia 的 CLI 会直接报 "noctalia is not running"。失败时按实际存在的 socket 反推 display 重试。
+nmsg() {
+    local out sock d
+    if out=$(noctalia msg "$@" 2>&1) && [[ $out != *"not running"* ]]; then
+        printf '%s\n' "$out"
+        return 0
+    fi
+    for sock in "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"/noctalia-wayland-*.sock; do
+        [[ -S $sock ]] || continue
+        d=${sock##*/noctalia-}
+        d=${d%.sock}
+        if out=$(WAYLAND_DISPLAY="$d" noctalia msg "$@" 2>&1) && [[ $out != *"not running"* ]]; then
+            printf '%s\n' "$out"
+            return 0
+        fi
+    done
+    printf '%s\n' "$out" >&2
+    return 1
+}
+
+# 插件把分配记在 assignments.json（connector -> 视频路径，"*" 表示所有输出）
+current_video() {
+    [[ -f $ASSIGNMENTS ]] || return 0
+    python3 - "$ASSIGNMENTS" <<'PY'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+a = data.get("assignments", data) if isinstance(data, dict) else {}
+for key in ("eDP-1", "eDP-2", "eDP-3"):
+    if a.get(key):
+        print(a[key]); sys.exit(0)
+if a.get("*"):
+    print(a["*"])
+PY
+}
+
+extract_frame() {
+    local video=$1 at=${2:-} dur
+    mkdir -p "$CACHE_DIR"
+    if [[ -z $at ]]; then
+        dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$video" 2>/dev/null)
+        [[ -n $dur ]] || die "读取视频时长失败: $video"
+        at=$(python3 -c "print(round(float('$dur') / 2, 3))")
+    fi
+    # 只抽缩小后的图：4K 原帧既慢又占纹理内存，取色和 overview 都用不上全分辨率
+    ffmpeg -v error -y -ss "$at" -i "$video" -frames:v 1 -update 1 \
+        -vf "scale='min($FRAME_MAX,iw)':-2" -q:v 3 "$FRAME_FILE" \
+        || die "抽帧失败: $video @ ${at}s"
+    printf '%s\n' "$at"
+}
+
+# overview 用的图：小尺寸 + 模糊。壁纸层只做背景底，不需要细节
+make_overview_frame() {
+    [[ -f $FRAME_FILE ]] || return 1
+    magick "$FRAME_FILE" -resize "${OVERVIEW_MAX}x" -blur "0x$OVERVIEW_BLUR" -quality 86 \
+        "$OVERVIEW_FILE" 2>/dev/null || cp -f "$FRAME_FILE" "$OVERVIEW_FILE"
+}
+
+# 每支视频的配色缓存键：路径 + 大小/mtime + 指定时间点
+cache_key() {
+    local video=$1 at=${2:-}
+    { printf '%s\n' "$video"; stat -c '%s %Y' "$video" 2>/dev/null; printf '%s\n' "$at"; } |
+        sha1sum | cut -c1-16
+}
+
+# niri overview 走「静态壁纸」路线：把抽的帧喂给 noctalia 的壁纸层。
+# 视频在播时 mpvpaper 插件会把这个输出标成 externally-managed（
+# Wallpaper::setOutputExternallyManaged，src/shell/wallpaper/wallpaper.cpp:907），
+# 壁纸层直接不创建，wallpaper-set 也清不掉这个标记 —— 所以走本地插件
+# local/video-frame 的 IPC，它先 setWallpaperEnabled(true) 再 setWallpaper(帧)。
+# 结果：桌面仍是 mpvpaper 的视频，overview 显示这一帧静态图。
+push_overview_frame() {
+    local frame="$1" out i
+    [[ -f $frame ]] || return 0
+    # mpvpaper 插件（重）启动时会把壁纸层撤掉（externally-managed），而且这个动作
+    # 可能发生在我们推完之后（插件重启要 1~2s）—— 所以推完等一会儿再用 niri 的层
+    # 列表验证，没了就再推，而不是推一次就认为成功。
+    for i in 1 2 3 4; do
+        out=$(nmsg plugin local/video-frame:service all frame "$frame" 2>&1)
+        case "$out" in
+            *enabled* | *unknown* | *not\ found* | *no\ such*)
+                nmsg plugins enable local/video-frame >/dev/null 2>&1
+                ;;
+        esac
+        sleep 1.2
+        niri msg layers 2>/dev/null | grep -q 'Namespace: "noctalia-wallpaper"' && return 0
+    done
+    printf 'warn: overview 帧推送失败（local/video-frame）: %s\n' "$out" >&2
+    return 1
+}
+
+colors() {
+    local video="${1:-}" at=${2:-} sec scheme cache
+    [[ -n $video ]] || die "未指定视频；用法: video-wallpaper colors <视频> [秒]"
+    [[ -f $video ]] || die "视频不存在: $video"
+    [[ -f $NOCTALIA_DIR/morandi-gen.py ]] || die "找不到 $NOCTALIA_DIR/morandi-gen.py"
+
+    cache="$CACHE_ROOT/$(cache_key "$video" "$at")"
+    if [[ -f $cache/frame.jpg ]]; then
+        cp -f "$cache/frame.jpg" "$FRAME_FILE"
+        printf '命中缓存: %s\n' "$(basename "$video")"
+    else
+        sec=$(extract_frame "$video" "$at")
+        printf '抽帧: %s @ %ss -> %s\n' "$(basename "$video")" "$sec" "$FRAME_FILE"
+    fi
+
+    # 0) overview 用压缩+模糊过的小图（静态壁纸路线）。放在配色之前：setWallpaper
+    #    会触发 wallpaper_changed hook（用户的 apply-morandi.sh）
+    make_overview_frame
+    push_overview_frame "$OVERVIEW_FILE"
+
+    # 1~3) 配色：有缓存就直接用，不重跑 theme/morandi-gen（后者会重写一堆应用配置，很费 CPU）
+    if [[ ! -f $cache/palette.json ]]; then
+    # 1) 扁平 token 表：给 morandi-gen.py 和 niri/kitty/fcitx5 等应用用（沿用 morandi 的 muted 方案）
+    noctalia theme "$FRAME_FILE" --scheme muted -o "$NOCTALIA_DIR/colors.json" \
+        || die "noctalia theme 生成 colors.json 失败"
+
+    # 2) v2 palette 文件：给 noctalia 自身 UI（theme.source = custom）
+    #    这里不能用 muted —— 近白/线稿画面上 muted 会退化成全白 primary，丢掉强调色
+    scheme="$PALETTE_SCHEME"
+    if [[ -z $scheme ]]; then
+        scheme=$(nmsg config-get theme.wallpaper_scheme 2>/dev/null | tr -d "\"'")
+        scheme="${scheme:-m3-content}"
+    fi
+    noctalia theme "$FRAME_FILE" --scheme "$scheme" --both -o "$CACHE_DIR/palette.raw.json" \
+        || die "noctalia theme 生成 palette 失败"
+    mkdir -p "$NOCTALIA_DIR/palettes"
+    python3 - "$CACHE_DIR/palette.raw.json" "$NOCTALIA_DIR/palettes/$PALETTE_NAME.json" <<'PY' \
+        || die "palette 转换失败"
+import json, sys
+
+src, dst = sys.argv[1], sys.argv[2]
+raw = json.load(open(src))
+
+
+def to_v2(tokens):
+    """扁平 terminal_* 键 -> v2 的嵌套 terminal 结构"""
+    out, term = {}, {}
+    for key, val in tokens.items():
+        if key.startswith("terminal_"):
+            term[key[len("terminal_"):]] = val
+        else:
+            out[key] = val
+    nested = {}
+    for key in ("background", "foreground", "cursor", "cursor_text",
+                "selection_bg", "selection_fg"):
+        if key in term:
+            nested[key] = term.pop(key)
+    for group in ("normal", "bright"):
+        sub = {c: term.pop(f"{group}_{c}")
+               for c in ("black", "red", "green", "yellow", "blue",
+                         "magenta", "cyan", "white")
+               if f"{group}_{c}" in term}
+        if sub:
+            nested[group] = sub
+    nested.update(term)
+    if nested:
+        out["terminal"] = nested
+    return out
+
+
+palette = {"version": 2}
+for mode in ("dark", "light"):
+    if mode in raw:
+        palette[mode] = to_v2(raw[mode])
+json.dump(palette, open(dst, "w"), indent=2, ensure_ascii=False)
+PY
+
+    # 3) 其余应用：niri 边框、kitty/alacritty、fcitx5、starship、fastfetch、Qt、limine 等
+    python3 "$NOCTALIA_DIR/morandi-gen.py" --wallpaper "$FRAME_FILE"
+
+        # 全部生成完才写缓存，避免半成品被命中
+        mkdir -p "$cache"
+        cp -f "$FRAME_FILE" "$cache/frame.jpg"
+        cp -f "$NOCTALIA_DIR/colors.json" "$cache/colors.json"
+        cp -f "$NOCTALIA_DIR/palettes/$PALETTE_NAME.json" "$cache/palette.json"
+    else
+        cp -f "$cache/colors.json" "$NOCTALIA_DIR/colors.json"
+        cp -f "$cache/palette.json" "$NOCTALIA_DIR/palettes/$PALETTE_NAME.json"
+    fi
+
+    # 4) 让 noctalia 自己的 UI 改用这份 palette（幂等）
+    # 注意：config-set 只吃 TOML 字面量，字符串要自带引号；color-scheme-set 是专用入口
+    # 放在 morandi-gen 之后，避免它或它调用的东西把配色源改回 wallpaper
+    for attempt in 1 2 3; do
+        nmsg color-scheme-set custom "$PALETTE_NAME" >/dev/null 2>&1 && break
+        sleep 1
+        [[ $attempt == 3 ]] && printf 'warn: noctalia 切换 custom 配色失败\n' >&2
+    done
+
+    printf '%s\n' "$video" >"$LAST_FILE"
+    printf '配色已更新: %s\n' "$(basename "$video")"
+}
+
+# 没有视频时回到 noctalia 自己的「从静态壁纸取色」
+restore_static() {
+    local scheme attempt
+    scheme=$(nmsg config-get theme.wallpaper_scheme 2>/dev/null | tr -d "\"'")
+    scheme="${scheme:-m3-content}"
+    # 和用户自己的 wallpaper_changed hook（apply-morandi.sh）并发跑，偶发抢不到 IPC，重试几次
+    for attempt in 1 2 3; do
+        if nmsg color-scheme-set wallpaper "$scheme" >/dev/null 2>&1; then
+            printf '已回到静态壁纸配色 (wallpaper %s)\n' "$scheme"
+            break
+        fi
+        sleep 2
+    done
+    : >"$LAST_FILE"
+}
+
+# 视频所在目录：优先读插件设置 video_directory，否则用默认
+video_dir() {
+    local d
+    d=$(nmsg config-get 'plugin_settings."noctalia/mpvpaper".video_directory' 2>/dev/null |
+        grep -oE '"[^"]+"' | head -1 | tr -d '"')
+    printf '%s\n' "${d:-$HOME/Pictures/WallPapers}"
+}
+
+# 视频中点（秒）
+video_midpoint() {
+    local dur
+    dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$1" 2>/dev/null)
+    [[ -n $dur ]] || return 1
+    python3 -c "print(round(float('$dur') / 2, 3))"
+}
+
+# 海报代理：noctalia 壁纸面板只扫图片扩展名，视频进不去。
+# 给每个视频在旁边生成 <视频>.jpg（抽一帧 + 右下角播放角标），点它由 hook 换成视频。
+posters() {
+    local dir=${1:-$(video_dir)} v poster tmp at w h cx cy r n=0
+    [[ -d $dir ]] || die "目录不存在: $dir"
+    shopt -s nullglob
+    for v in "$dir"/*.mp4 "$dir"/*.webm "$dir"/*.mkv "$dir"/*.mov; do
+        poster="$v.jpg"
+        [[ -f $poster && ! $v -nt $poster ]] && continue
+        at=$(video_midpoint "$v") || continue
+        tmp=$(mktemp --suffix=.png)
+        if ffmpeg -v error -y -ss "$at" -i "$v" -frames:v 1 -vf 'scale=1280:-2' "$tmp" 2>/dev/null; then
+            read -r w h < <(magick identify -format '%w %h' "$tmp")
+            cx=$((w - 46)) cy=$((h - 46)) r=26
+            if magick "$tmp" \
+                -fill 'rgba(0,0,0,0.45)' -stroke none -draw "circle $cx,$cy $((cx + r)),$cy" \
+                -fill white -stroke none \
+                -draw "polygon $((cx - 7)),$((cy - 12)) $((cx + 12)),$cy $((cx - 7)),$((cy + 12))" \
+                -quality 88 "$poster"; then
+                n=$((n + 1))
+                printf '海报: %s\n' "$(basename "$poster")"
+            fi
+        fi
+        rm -f "$tmp"
+    done
+    printf '共生成/更新 %d 张海报（%s）\n' "$n" "$dir"
+}
+
+# 让插件播放指定视频。插件 IPC 没有“指定路径”的入口，服务只在启动时读
+# assignments.json，所以先改文件、再重启插件服务让它加载。
+plugin_set_video() {
+    local video=$1 cur keys
+    [[ -f $video ]] || die "视频不存在: $video"
+    cur=$(current_video)
+    if [[ $cur == "$video" ]]; then
+        # 点的是正在播的那支视频的海报：overview 里会留着带播放角标的海报，
+        # 交给调用方的 sync 重推干净帧
+        printf '已经是当前视频: %s\n' "$(basename "$video")"
+        return 0
+    fi
+    mkdir -p "${ASSIGNMENTS%/*}"
+    python3 - "$ASSIGNMENTS" "$video" <<'PY' || die '写 assignments.json 失败'
+import json, os, sys
+
+path, video = sys.argv[1], sys.argv[2]
+data = {}
+if os.path.exists(path):
+    try:
+        data = json.load(open(path))
+    except Exception:
+        data = {}
+if not isinstance(data, dict):
+    data = {}
+a = data.get("assignments")
+if not isinstance(a, dict):
+    a = {k: v for k, v in data.items() if isinstance(v, str)}
+# 沿用已有的分配方式：有 "*" 就继续用通配，否则保持原来的 connector 键
+keys = list(a.keys()) or ["*"]
+data["assignments"] = {k: video for k in keys}
+json.dump(data, open(path, "w"), indent=2, ensure_ascii=False)
+PY
+    nmsg plugins disable noctalia/mpvpaper >/dev/null 2>&1
+    sleep 0.3
+    nmsg plugins enable noctalia/mpvpaper >/dev/null 2>&1
+    local waited=0
+    while [[ -z $(mpvpaper_pids) ]] && (( waited < 20 )); do
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+    if [[ -n $(mpvpaper_pids) ]]; then
+        printf '开始播放: %s\n' "$(basename "$video")"
+    else
+        printf 'warn: 插件没有拉起 mpvpaper，请手动在影片面板里选一次\n' >&2
+    fi
+}
+
+# 用户在静态壁纸面板里换了壁纸：视频壁纸应该让位。
+# 插件自己不知道壁纸变了（它没有 wallpaper 事件），所以要主动发 clear-all。
+# 前提：插件设置 extract_last_frame = false，否则 clear 会用视频帧覆盖用户刚选的壁纸。
+on_static_wallpaper() {
+    local wp video
+    wp=$(nmsg wallpaper-get 2>/dev/null)
+    # 点的是海报代理（<视频>.jpg）→ 换成播放对应视频
+    case "$wp" in
+        *.mp4.jpg | *.webm.jpg | *.mkv.jpg | *.mov.jpg)
+            video="${wp%.jpg}"
+            [[ -f $video ]] || return 0
+            plugin_set_video "$video"
+            # 插件重启会把壁纸层撤掉，等它稳定后再推一次 overview 帧（sync 内部会去重）
+            sync
+            return 0
+            ;;
+    esac
+    # 插件自己把视频帧喂给壁纸服务（overview 背景）时也会触发 hook，不能当成用户换了壁纸
+    case "$wp" in
+        */.cache/noctalia/mpvpaper/* | */.cache/video-wallpaper/*) return 0 ;;
+    esac
+    [[ -n $(current_video) ]] || return 0
+    nmsg plugin noctalia/mpvpaper:service all clear-all >/dev/null 2>&1 \
+        && printf '检测到静态壁纸切换，已停止视频壁纸\n'
+}
+
+sync() {
+    local video last
+    # path 单元和 hook 里的 sync 会并发（换视频时两边同时跑），串行化避免抢着写 palette
+    mkdir -p "$CACHE_DIR"
+    exec 9>"$CACHE_DIR/sync.lock"
+    flock -w 90 9 || { printf 'warn: 等 sync 锁超时\n' >&2; return 0; }
+    video=$(current_video)
+    last=$(cat "$LAST_FILE" 2>/dev/null)
+    if [[ -n $video ]]; then
+        [[ -f $video ]] || { printf 'warn: 分配的视频不存在: %s\n' "$video" >&2; return 0; }
+        if [[ $video == "$last" ]]; then
+            # 没换视频：配色不用重算，但壁纸层可能被插件重启撤掉了（或刚点过同一支视频的海报），
+            # 所以还是验证/重推一下 overview 帧
+            [[ -f $FRAME_FILE ]] && { make_overview_frame; push_overview_frame "$OVERVIEW_FILE"; }
+            return 0
+        fi
+        colors "$video"
+    elif [[ -n $(mpvpaper_pids) ]]; then
+        # 状态文件与进程不一致：clear 后 mpvpaper 还在退场（kill 是异步的）。
+        # 等它真正退出再判断，否则会错过最后一次状态变化
+        local waited=0
+        while [[ -n $(mpvpaper_pids) ]] && (( waited < 15 )); do
+            sleep 1
+            waited=$((waited + 1))
+        done
+        [[ -z $(mpvpaper_pids) ]] || return 0
+        [[ -n $last ]] || return 0
+        restore_static
+    else
+        [[ -n $last ]] || return 0
+        restore_static
+    fi
+}
+
+status() {
+    local video; video=$(current_video)
+    printf '当前视频: %s\n' "${video:-<无，静态壁纸>}"
+    local pids; pids=$(mpvpaper_pids | tr '\n' ' ')
+    if [[ -n $pids ]]; then
+        printf 'mpvpaper: 运行中 (pid %s)\n' "$pids"
+    else
+        printf 'mpvpaper: 未运行\n'
+    fi
+    printf 'noctalia 配色: %s\n' "$(nmsg color-scheme-get 2>/dev/null)"
+    printf '取色帧: %s (%s)\n' "$FRAME_FILE" "$(du -h "$FRAME_FILE" 2>/dev/null | cut -f1)"
+    printf 'overview 帧: %s (%s)\n' "$OVERVIEW_FILE" "$(du -h "$OVERVIEW_FILE" 2>/dev/null | cut -f1)"
+    if niri msg layers 2>/dev/null | grep -q 'Namespace: "noctalia-wallpaper"'; then
+        printf 'overview 壁纸层: 在\n'
+    else
+        printf 'overview 壁纸层: 不在（overview 会是空的）\n'
+    fi
+    printf '配色缓存: %s\n' "$(ls -1 "$CACHE_ROOT" 2>/dev/null | wc -l) 支视频"
+}
+
+case "${1:-status}" in
+    posters) shift; posters "$@" ;;
+    colors) shift; colors "$@" ;;
+    sync)   sync ;;
+    on-static-wallpaper) on_static_wallpaper ;;
+    status) status ;;
+    *)      die "未知命令: $1（可用: posters|colors|sync|status|on-static-wallpaper）" ;;
+esac

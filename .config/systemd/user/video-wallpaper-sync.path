@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch noctalia mpvpaper assignments for video wallpaper changes
+
+[Path]
+PathChanged=%h/.local/state/noctalia/mpvpaper/assignments.json
+Unit=video-wallpaper-sync.service
+
+[Install]
+WantedBy=default.target

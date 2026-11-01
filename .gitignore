@@ -2,3 +2,6 @@
 .config/noctalia/plugins/
 *.bak-*
 *.log
+# 视频壁纸运行时产物
+.config/noctalia/palettes/video-wallpaper.json
+*.bak.*

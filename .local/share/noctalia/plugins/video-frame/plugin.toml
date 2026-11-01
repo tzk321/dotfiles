@@ -1,0 +1,11 @@
+id = "local/video-frame"
+name = "Video Frame"
+version = "0.1.0"
+plugin_api = 43
+author = "sbtzk"
+license = "MIT"
+description = "Feeds a still frame to noctalia's wallpaper surface while mpvpaper plays."
+
+[[service]]
+id = "service"
+entry = "main.luau"
