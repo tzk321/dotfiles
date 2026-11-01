@@ -1,7 +1,7 @@
     animations {
-        // 工作区切换：非常丝滑的滑动，无回弹 (macOS 风格)
+        // 工作区切换：快速顺滑的滑动，无回弹 (stiffness 越高越快)
         workspace-switch {
-            spring damping-ratio=1.0 stiffness=140 epsilon=0.0001
+            spring damping-ratio=1.0 stiffness=450 epsilon=0.0001
         }
         // 窗口打开：优雅的缓入，绝对平滑
         window-open {
@@ -32,9 +32,9 @@ vec4 close_color(vec3 coords_geo, vec3 size_geo) {
 }
 "#
         }
-        // 水平视图移动（滚轮或触控板滚动）：极致顺滑
+        // 水平视图移动（滚轮或触控板滚动）：跟手快速
         horizontal-view-movement {
-            spring damping-ratio=1.0 stiffness=140 epsilon=0.0001
+            spring damping-ratio=1.0 stiffness=400 epsilon=0.0001
         }
         // 窗口移动（比如被推开或者拖动后归位）：平稳归位，没有果冻感
         window-movement {

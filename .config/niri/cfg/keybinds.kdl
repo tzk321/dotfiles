@@ -11,13 +11,12 @@ binds {
     // ─── Applications ───
     Mod+Q                          hotkey-overlay-title="Open Terminal: kitty" { spawn "kitty"; }
     Mod+R                    hotkey-overlay-title="Open App Launcher: noctalia launcher" { spawn-sh "noctalia msg panel-toggle launcher"; }
-    Mod+B                               hotkey-overlay-title="Open Browser: firefox" { spawn "firefox"; }
+    Mod+G                               hotkey-overlay-title="File Manager: Nautilus" { spawn "nautilus"; }
     Mod+ALT+L                           hotkey-overlay-title="Lock Screen: noctalia lock" { spawn-sh "noctalia msg session lock"; }
     Mod+Shift+Q                        hotkey-overlay-title="Session Menu: noctalia sessionMenu" { spawn-sh "noctalia msg panel-toggle sessionMenu"; }
     Mod+A                               hotkey-overlay-title="Control Center: noctalia control-center" { spawn-sh "noctalia msg panel-toggle control-center"; }
 
-    // Please choose your own file manager.
-    Mod+E                               hotkey-overlay-title="File Manager: yazi" { spawn "kitty" "yazi"; }
+    Mod+E                               hotkey-overlay-title="Open Browser: firefox" { spawn "firefox"; }
 
     // ─── Media Controls ───
     XF86AudioRaiseVolume                allow-when-locked=true { spawn-sh "noctalia msg volume-up"; }
