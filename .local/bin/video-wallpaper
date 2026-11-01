@@ -20,7 +20,14 @@ set -uo pipefail
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/video-wallpaper"
 LAST_FILE="$CACHE_DIR/last-video"
 FRAME_FILE="$CACHE_DIR/frame.jpg"
-OVERVIEW_FILE="$CACHE_DIR/overview.jpg"
+# overview 帧必须每支视频一个路径：noctalia 的纹理缓存是**按路径**索引的
+# （src/render/core/shared_texture_cache.h:51 "Path-keyed, refcounted cache"），
+# 而且 src/shell/wallpaper/wallpaper.cpp:1378 有 `if (path == instance.loadingPath) return;`
+# —— 固定路径会让换了视频后 overview 还显示上一张。
+OVERVIEW_FILE=""
+overview_path() {
+    printf '%s/%s/overview.jpg\n' "$CACHE_ROOT" "$(cache_key "$1" "${2:-}")"
+}
 CACHE_ROOT="$CACHE_DIR/palette-cache"
 FRAME_MAX=1600     # 抽帧/取色用的长边（原视频 4K，不需要全图）
 OVERVIEW_MAX=1280  # 喂给壁纸层（overview）的长边
@@ -95,7 +102,8 @@ extract_frame() {
 
 # overview 用的图：小尺寸 + 模糊。壁纸层只做背景底，不需要细节
 make_overview_frame() {
-    [[ -f $FRAME_FILE ]] || return 1
+    [[ -f $FRAME_FILE && -n $OVERVIEW_FILE ]] || return 1
+    mkdir -p "$(dirname "$OVERVIEW_FILE")"
     magick "$FRAME_FILE" -resize "${OVERVIEW_MAX}x" -blur "0x$OVERVIEW_BLUR" -quality 86 \
         "$OVERVIEW_FILE" 2>/dev/null || cp -f "$FRAME_FILE" "$OVERVIEW_FILE"
 }
@@ -140,6 +148,7 @@ colors() {
     [[ -f $NOCTALIA_DIR/morandi-gen.py ]] || die "找不到 $NOCTALIA_DIR/morandi-gen.py"
 
     cache="$CACHE_ROOT/$(cache_key "$video" "$at")"
+    OVERVIEW_FILE=$(overview_path "$video" "$at")
     if [[ -f $cache/frame.jpg ]]; then
         cp -f "$cache/frame.jpg" "$FRAME_FILE"
         printf '命中缓存: %s\n' "$(basename "$video")"
@@ -249,6 +258,8 @@ restore_static() {
         fi
         sleep 2
     done
+    nmsg color-scheme-get 2>/dev/null | grep -q '^wallpaper' \
+        || printf 'warn: 配色源没切回静态壁纸，当前: %s\n' "$(nmsg color-scheme-get 2>/dev/null)" >&2
     : >"$LAST_FILE"
 }
 
@@ -366,8 +377,12 @@ on_static_wallpaper() {
         */.cache/noctalia/mpvpaper/* | */.cache/video-wallpaper/*) return 0 ;;
     esac
     [[ -n $(current_video) ]] || return 0
-    nmsg plugin noctalia/mpvpaper:service all clear-all >/dev/null 2>&1 \
-        && printf '检测到静态壁纸切换，已停止视频壁纸\n'
+    if nmsg plugin noctalia/mpvpaper:service all clear-all >/dev/null 2>&1; then
+        printf '检测到静态壁纸切换，已停止视频壁纸\n'
+        # 不依赖 path 单元去恢复配色源：那一步受插件重启/IPC 抖动影响，
+        # 漏了就会停在 custom video-wallpaper（用户看到的“有时自动变自定义”）
+        sync
+    fi
 }
 
 sync() {
@@ -383,22 +398,21 @@ sync() {
         if [[ $video == "$last" ]]; then
             # 没换视频：配色不用重算，但壁纸层可能被插件重启撤掉了（或刚点过同一支视频的海报），
             # 所以还是验证/重推一下 overview 帧
-            [[ -f $FRAME_FILE ]] && { make_overview_frame; push_overview_frame "$OVERVIEW_FILE"; }
+            OVERVIEW_FILE=$(overview_path "$video")
+            [[ -f $FRAME_FILE ]] && { make_overview_frame && push_overview_frame "$OVERVIEW_FILE"; }
             return 0
         fi
         colors "$video"
-    elif [[ -n $(mpvpaper_pids) ]]; then
-        # 状态文件与进程不一致：clear 后 mpvpaper 还在退场（kill 是异步的）。
-        # 等它真正退出再判断，否则会错过最后一次状态变化
+    else
+        # 没有视频了：mpvpaper 的 kill 是异步的，先等它退场（最多 5s），
+        # 然后**无论如何**把配色源切回静态壁纸——之前这里等不到进程退出就直接
+        # return，导致配色源停在 custom video-wallpaper（用户看到的“有时自动变自定义”）
         local waited=0
-        while [[ -n $(mpvpaper_pids) ]] && (( waited < 15 )); do
+        while [[ -n $(mpvpaper_pids) ]] && (( waited < 5 )); do
             sleep 1
             waited=$((waited + 1))
         done
-        [[ -z $(mpvpaper_pids) ]] || return 0
-        [[ -n $last ]] || return 0
-        restore_static
-    else
+        [[ -n $(current_video) ]] && return 0 # 等待期间又换了视频，交给那次 sync
         [[ -n $last ]] || return 0
         restore_static
     fi
@@ -415,7 +429,12 @@ status() {
     fi
     printf 'noctalia 配色: %s\n' "$(nmsg color-scheme-get 2>/dev/null)"
     printf '取色帧: %s (%s)\n' "$FRAME_FILE" "$(du -h "$FRAME_FILE" 2>/dev/null | cut -f1)"
-    printf 'overview 帧: %s (%s)\n' "$OVERVIEW_FILE" "$(du -h "$OVERVIEW_FILE" 2>/dev/null | cut -f1)"
+    if [[ -n $video ]]; then
+        OVERVIEW_FILE=$(overview_path "$video")
+        printf 'overview 帧: %s (%s)\n' "$OVERVIEW_FILE" "$(du -h "$OVERVIEW_FILE" 2>/dev/null | cut -f1)"
+    else
+        printf 'overview 帧: <无视频>\n'
+    fi
     if niri msg layers 2>/dev/null | grep -q 'Namespace: "noctalia-wallpaper"'; then
         printf 'overview 壁纸层: 在\n'
     else
