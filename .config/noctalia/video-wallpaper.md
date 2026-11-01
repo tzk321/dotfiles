@@ -100,3 +100,9 @@ niri msg layers | grep -E "mpvpaper|noctalia-wallpaper"   # 哪个层在画背�
 noctalia msg plugin noctalia/mpvpaper:service all reapply # 手动拉起视频
 noctalia msg plugin noctalia/mpvpaper:service all clear-all
 ```
+
+## 配色源自愈
+
+`video-wallpaper reconcile` 由 `video-wallpaper-reconcile.timer`（每 20s）调用，
+只修一种偏差：已经没有视频分配、配色源却停在 `custom video-wallpaper` 时切回
+`wallpaper <theme.wallpaper_scheme>`。其他情况不动，避免抢用户手选的配色源。

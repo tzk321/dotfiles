@@ -39,6 +39,8 @@ for f in \
   .config/systemd/user/video-wallpaper-sync.service \
   .config/systemd/user/video-wallpaper-posters.path \
   .config/systemd/user/video-wallpaper-posters.service \
+  .config/systemd/user/video-wallpaper-reconcile.service \
+  .config/systemd/user/video-wallpaper-reconcile.timer \
   .config/noctalia/video-wallpaper.md; do
   link "$REPO/$f" "$HOME/$f"
 done
@@ -56,6 +58,7 @@ cat <<'EOF'
   - 已安装的额外字体（如 LXGW Neo XiHei）不在仓库里，需要自行放到 ~/.local/share/fonts/。
   - 视频壁纸：链接完后执行
       systemctl --user daemon-reload
-      systemctl --user enable --now video-wallpaper-sync.path video-wallpaper-posters.path
+      systemctl --user enable --now video-wallpaper-sync.path \
+        video-wallpaper-posters.path video-wallpaper-reconcile.timer
     并在 noctalia 设置里启用 local/video-frame 插件。
 EOF

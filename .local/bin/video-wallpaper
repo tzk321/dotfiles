@@ -235,6 +235,13 @@ PY
     # 4) 让 noctalia 自己的 UI 改用这份 palette（幂等）
     # 注意：config-set 只吃 TOML 字面量，字符串要自带引号；color-scheme-set 是专用入口
     # 放在 morandi-gen 之后，避免它或它调用的东西把配色源改回 wallpaper
+    # 但链路要跑好几秒，期间用户可能已经切回静态壁纸了——那时再写 custom 就会把
+    # 配色源扒回自定义（用户看到的“有时自己变成自定义”），所以先复核一遍分配
+    if [[ -z $(current_video) ]]; then
+        printf 'warn: 取色期间视频已被切走，不写 custom 配色\n' >&2
+        restore_static
+        return 0
+    fi
     for attempt in 1 2 3; do
         nmsg color-scheme-set custom "$PALETTE_NAME" >/dev/null 2>&1 && break
         sleep 1
@@ -358,6 +365,16 @@ PY
 # 用户在静态壁纸面板里换了壁纸：视频壁纸应该让位。
 # 插件自己不知道壁纸变了（它没有 wallpaper 事件），所以要主动发 clear-all。
 # 前提：插件设置 extract_last_frame = false，否则 clear 会用视频帧覆盖用户刚选的壁纸。
+# 等插件真正落地 clear-all：dispatch 是异步的，不等就可能读到旧的 assignment
+wait_no_video() {
+    local i
+    for i in $(seq 1 12); do
+        [[ -z $(current_video) ]] && return 0
+        sleep 0.5
+    done
+    return 1
+}
+
 on_static_wallpaper() {
     local wp video
     wp=$(nmsg wallpaper-get 2>/dev/null)
@@ -381,7 +398,13 @@ on_static_wallpaper() {
         printf '检测到静态壁纸切换，已停止视频壁纸\n'
         # 不依赖 path 单元去恢复配色源：那一步受插件重启/IPC 抖动影响，
         # 漏了就会停在 custom video-wallpaper（用户看到的“有时自动变自定义”）
-        sync
+        # 必须先等 clear-all 落地再 sync，否则 sync 读到旧 assignment 会又跑
+        # 一遍 colors() 把配色源写回 custom
+        if wait_no_video; then
+            sync
+        else
+            printf 'warn: 插件 6s 内没清掉分配，等 path 单元兜底\n' >&2
+        fi
     fi
 }
 
@@ -443,11 +466,22 @@ status() {
     printf '配色缓存: %s\n' "$(ls -1 "$CACHE_ROOT" 2>/dev/null | wc -l) 支视频"
 }
 
+# 幂等巡检（systemd timer 每 20s 跑一次）：只修一种偏差——
+# 已经没有视频了，配色源却还是 custom video-wallpaper。
+# 其余情况一律不动，避免抢用户手选的配色源（内置/社区/壁纸）。
+reconcile() {
+    [[ -z $(current_video) ]] || return 0
+    case "$(nmsg color-scheme-get 2>/dev/null)" in
+        "custom $PALETTE_NAME") restore_static ;;
+    esac
+}
+
 case "${1:-status}" in
     posters) shift; posters "$@" ;;
     colors) shift; colors "$@" ;;
     sync)   sync ;;
+    reconcile) reconcile ;;
     on-static-wallpaper) on_static_wallpaper ;;
     status) status ;;
-    *)      die "未知命令: $1（可用: posters|colors|sync|status|on-static-wallpaper）" ;;
+    *)      die "未知命令: $1（可用: posters|colors|sync|reconcile|status|on-static-wallpaper）" ;;
 esac

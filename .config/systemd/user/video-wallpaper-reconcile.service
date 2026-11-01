@@ -1,0 +1,6 @@
+[Unit]
+Description=Reconcile noctalia color scheme with video wallpaper state
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/video-wallpaper reconcile

@@ -1,0 +1,9 @@
+[Unit]
+Description=Periodically reconcile noctalia color scheme
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=20s
+
+[Install]
+WantedBy=timers.target
