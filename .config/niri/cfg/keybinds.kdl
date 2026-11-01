@@ -15,7 +15,7 @@ binds {
     Mod+ALT+L                           hotkey-overlay-title="Lock Screen: noctalia lock" { spawn-sh "noctalia msg session lock"; }
     Mod+Shift+Q                        hotkey-overlay-title="Session Menu: noctalia sessionMenu" { spawn-sh "noctalia msg panel-toggle sessionMenu"; }
     Mod+A                               hotkey-overlay-title="Control Center: noctalia control-center" { spawn-sh "noctalia msg panel-toggle control-center"; }
-
+    Mod+Return { spawn "kitty" "btop"; }
     Mod+E                               hotkey-overlay-title="Open Browser: firefox" { spawn "firefox"; }
 
     // ─── Media Controls ───
@@ -125,7 +125,7 @@ binds {
     //Mod+W                               { toggle-column-tabbed-display; }
 
     // ─── Screenshots ───
-    Alt+CTRL+A                          { spawn "babry"; } // Babry 智能区域截图
+    Alt+CTRL+A                          { spawn "babry" "--save-dir" "/home/sbtzk/Pictures/Screenshots"; } // Babry 智能区域截图（存 ~/Pictures/Screenshots）
     Print                               { screenshot-screen; } // Quick fullscreen screenshot of focused monitor
     CTRL+Shift+1                        { screenshot; }
     CTRL+Shift+2                        { screenshot-screen; }
