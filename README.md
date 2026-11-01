@@ -17,6 +17,8 @@ sbtzk 的桌面配置（niri + kitty + GTK/Qt + fontconfig + noctalia）。
 | `.config/gtk-3.0/`, `.config/gtk-4.0/` | GTK 主题/字体/光标 |
 | `.config/fontconfig/` | 字体 fallback 与渲染策略 |
 | `.config/environment.d/` | systemd 用户会话环境变量（niri 由 systemd 拉起） |
+| `.config/fish/` | fish 配置；`theme.fish` 由「换笺」生成，依赖的 `/usr/local/bin/{拾句,换笺,簿}` 未入库 |
+| `.config/nvim/` | Neovim（LazyVim 起步配置，`lazy-lock.json` 锁定插件版本） |
 | `.config/noctalia/` | 状态栏配置（`plugins/` 为第三方下载，未纳入仓库） |
 | `firefox/user.js` | Firefox 的 `layout.css.devPixelsPerPx`（见下），需手动拷到 profile 目录 |
 
